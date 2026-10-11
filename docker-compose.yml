@@ -1,0 +1,48 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: cloudcomputing-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: "rootCC2026!"
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./db-init/01-inventory.sql:/docker-entrypoint-initdb.d/01-inventory.sql:ro
+      - ./db-init/02-pos.sql:/docker-entrypoint-initdb.d/02-pos.sql:ro
+
+  inventory:
+    build: .
+    container_name: cloudcomputing-inventory
+    restart: unless-stopped
+    ports:
+      - "8081:80"
+    environment:
+      DB_HOST: db
+      DB_NAME: inventory_management
+      DB_USER: root
+      DB_PASS: "rootCC2026!"
+    volumes:
+      - ./inventory-management-system-main:/var/www/html
+    depends_on:
+      - db
+
+  pos:
+    build: .
+    container_name: cloudcomputing-pos
+    restart: unless-stopped
+    ports:
+      - "8082:80"
+    environment:
+      DB_HOST: db
+      DB_NAME: DB_Pos
+      DB_USER: root
+      DB_PASS: "rootCC2026!"
+    volumes:
+      - ./POS-PHP-main:/var/www/html
+    depends_on:
+      - db
+
+volumes:
+  mysql_data:
