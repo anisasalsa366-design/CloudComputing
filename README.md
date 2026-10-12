@@ -57,3 +57,8 @@ Menerapkan konsep containerization menggunakan Docker serta mengintegrasikan dua
 
 ## Status
 Proyek dibuat untuk memenuhi tugas mata kuliah Cloud Computing.
+
+## Anggota Kelompok 5
+Azzahra Nabila Diarsa (240602048)
+Anisa Salsa Faradila (240602055)
+Nadia Nur Lailatus Salwa (240602060)
