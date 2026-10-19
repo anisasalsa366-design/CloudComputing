@@ -44,5 +44,33 @@ services:
     depends_on:
       - db
 
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: cloudcomputing-phpmyadmin
+    restart: unless-stopped
+    ports:
+      - "8083:80"
+    environment:
+      PMA_HOST: db
+      PMA_PORT: 3306
+    depends_on:
+      - db
+
+  inventory-api:
+    build: .
+    container_name: cloudcomputing-inventory-api
+    restart: unless-stopped
+    ports:
+      - "8084:80"
+    environment:
+      DB_HOST: db
+      DB_NAME: inventory_management
+      DB_USER: root
+      DB_PASS: "rootCC2026!"
+    volumes:
+      - ./inventory-api:/var/www/html
+    depends_on:
+      - db
+
 volumes:
   mysql_data:
