@@ -1,0 +1,300 @@
+<?php
+
+require("../connection.php");
+require("../getter/get_items.php");
+
+function redirect_transaction($code, $message = "")
+{
+    $url = "../../../pages/transaction?code=" . $code;
+
+    if ($message !== "") {
+        $url .= "&msg=" . rawurlencode($message);
+    }
+
+    header("Location: " . $url);
+    exit;
+}
+
+/**
+ * Memanggil Inventory API dan mengembalikan
+ * HTTP status serta JSON response.
+ */
+function inventory_api_request($path, $method, $payload, $idempotency_key)
+{
+    $headers = [
+        "Accept: application/json",
+        "Content-Type: application/json"
+    ];
+
+    if ($idempotency_key !== "") {
+        $headers[] = "Idempotency-Key: " . $idempotency_key;
+    }
+
+    $context = stream_context_create([
+        "http" => [
+            "method" => $method,
+            "timeout" => 8,
+            "ignore_errors" => true,
+            "header" => implode("\r\n", $headers),
+            "content" => json_encode($payload)
+        ]
+    ]);
+
+    $response = @file_get_contents(
+        "http://inventory-api" . $path,
+        false,
+        $context
+    );
+
+    $http_status = 0;
+
+    foreach ($http_response_header ?? [] as $header) {
+        if (preg_match('/^HTTP\/\S+\s+(\d{3})/', $header, $match)) {
+            $http_status = (int) $match[1];
+        }
+    }
+
+    if ($response === false) {
+        throw new RuntimeException(
+            "Inventory API tidak dapat dihubungi. Status penjualan perlu diperiksa sebelum mencoba ulang."
+        );
+    }
+
+    $json = json_decode($response, true);
+
+    if (!is_array($json)) {
+        throw new RuntimeException(
+            "Respons Inventory API tidak valid."
+        );
+    }
+
+    return [
+        "http_status" => $http_status,
+        "body" => $json
+    ];
+}
+
+if (
+    $_SERVER["REQUEST_METHOD"] !== "POST" ||
+    !isset($_POST["create_new_transaction"])
+) {
+    redirect_transaction(501, "Permintaan transaksi tidak valid.");
+}
+
+$item_id = filter_var(
+    $_POST["itemId"] ?? null,
+    FILTER_VALIDATE_INT
+);
+
+$transaction_id = trim($_POST["transactionId"] ?? "");
+$amount = filter_var(
+    $_POST["amountOfItem"] ?? null,
+    FILTER_VALIDATE_INT
+);
+
+$cash_raw = trim($_POST["cash"] ?? "");
+$cash_digits = preg_replace('/\D/', '', $cash_raw);
+$cash = ($cash_digits !== "")
+    ? filter_var($cash_digits, FILTER_VALIDATE_INT)
+    : false;
+
+if (
+    $item_id === false || $item_id < 1 ||
+    $amount === false || $amount < 1 || $amount > 1000000 ||
+    $transaction_id === "" || strlen($transaction_id) > 15 ||
+    !preg_match('/^[A-Za-z0-9._:-]+$/', $transaction_id) ||
+    $cash === false
+) {
+    redirect_transaction(
+        501,
+        "Input tidak valid. Periksa ID transaksi, jumlah barang, dan pembayaran."
+    );
+}
+
+$inventory_sale_completed = false;
+$in_transaction = false;
+$sale_key = "pos-" . $transaction_id;
+$compensation_key = "comp-" . $transaction_id;
+
+try {
+    /*
+     * Ambil SKU melalui daftar produk dari Inventory API,
+     * bukan query langsung ke database Inventory.
+     */
+    $products = get_inventory_products();
+    $selected_product = null;
+
+    foreach ($products as $product) {
+        if ((int) $product["item_id"] === (int) $item_id) {
+            $selected_product = $product;
+            break;
+        }
+    }
+
+    if ($selected_product === null) {
+        throw new RuntimeException(
+            "Produk tidak ditemukan di Inventory."
+        );
+    }
+
+    $sku = $selected_product["item_id_txt"];
+
+    if ($sku === "") {
+        throw new RuntimeException("SKU produk tidak valid.");
+    }
+
+    /*
+     * Minta Inventory API memvalidasi harga dan stok,
+     * sekaligus mengurangi stok secara atomik.
+     */
+    $sale_response = inventory_api_request(
+        "/api/sales",
+        "POST",
+        [
+            "sku" => $sku,
+            "quantity" => $amount
+        ],
+        $sale_key
+    );
+
+    if (
+        $sale_response["http_status"] !== 200 ||
+        ($sale_response["body"]["status"] ?? "") !== "success" ||
+        !isset($sale_response["body"]["sale"])
+    ) {
+        $message = $sale_response["body"]["message"]
+            ?? "Penjualan ditolak oleh Inventory API.";
+
+        throw new RuntimeException($message);
+    }
+
+    $sale = $sale_response["body"]["sale"];
+    $inventory_sale_completed = true;
+
+    $price = (float) ($sale["unit_price"] ?? -1);
+    $api_total = (float) ($sale["total"] ?? -1);
+    $expected_total = $price * $amount;
+
+    if (
+        !is_finite($price) ||
+        !is_finite($api_total) ||
+        $price < 0 ||
+        abs($api_total - $expected_total) > 0.01
+    ) {
+        throw new RuntimeException(
+            "Data harga dari Inventory API tidak valid."
+        );
+    }
+
+    $total = (int) round($api_total);
+
+    if ($cash < $total) {
+        throw new RuntimeException(
+            "Uang pembayaran kurang. Total belanja: " .
+            number_format($total, 0, ",", ".") . "."
+        );
+    }
+
+    $change = $cash - $total;
+    $created_at = date("m/d/Y h:i:s a");
+
+    $total_text = number_format($total, 0, ",", ".");
+    $cash_text = number_format($cash, 0, ",", ".");
+    $change_text = number_format($change, 0, ",", ".");
+    $amount_text = (string) $amount;
+
+    /*
+     * Simpan transaksi lokal POS.
+     * Indeks unik transaction_id_txt mencegah ID duplikat.
+     */
+    $conn->begin_transaction();
+    $in_transaction = true;
+
+    $transaction_stmt = $conn->prepare(
+        "INSERT INTO transactions
+         (
+             item_id,
+             transaction_id_txt,
+             transaction_create_at,
+             transaction_amount,
+             transaction_total,
+             transaction_cash,
+             transaction_money_changes
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
+    );
+
+    $transaction_stmt->bind_param(
+        "issssss",
+        $item_id,
+        $transaction_id,
+        $created_at,
+        $amount_text,
+        $total_text,
+        $cash_text,
+        $change_text
+    );
+
+    $transaction_stmt->execute();
+    $transaction_stmt->close();
+
+    $conn->commit();
+    $in_transaction = false;
+    $inventory_sale_completed = false;
+
+    redirect_transaction(200);
+
+} catch (Throwable $e) {
+    if ($in_transaction) {
+        try {
+            $conn->rollback();
+        } catch (Throwable $rollback_error) {
+            error_log("POS rollback failed: " . $rollback_error->getMessage());
+        }
+    }
+
+    error_log("POS transaction failed: " . $e->getMessage());
+
+    /*
+     * Jika API sudah mengurangi stok tetapi penyimpanan
+     * transaksi lokal gagal, minta Inventory API melakukan
+     * kompensasi dengan key yang stabil.
+     */
+    if ($inventory_sale_completed) {
+        try {
+            $compensation_response = inventory_api_request(
+                "/api/sales/compensate",
+                "POST",
+                ["sale_key" => $sale_key],
+                $compensation_key
+            );
+
+            if (
+                $compensation_response["http_status"] !== 200 ||
+                ($compensation_response["body"]["status"] ?? "") !== "success"
+            ) {
+                error_log(
+                    "Inventory compensation needs reconciliation for sale key: " .
+                    $sale_key
+                );
+
+                redirect_transaction(
+                    501,
+                    "Transaksi POS gagal disimpan dan pengembalian stok belum terkonfirmasi. Jangan ulangi penjualan ini; perlu pemeriksaan."
+                );
+            }
+        } catch (Throwable $compensation_error) {
+            error_log(
+                "Inventory compensation failed for " .
+                $sale_key . ": " . $compensation_error->getMessage()
+            );
+
+            redirect_transaction(
+                501,
+                "Transaksi POS gagal disimpan dan status pengembalian stok belum diketahui. Jangan ulangi penjualan ini; perlu pemeriksaan."
+            );
+        }
+    }
+
+    redirect_transaction(501, $e->getMessage());
+}
