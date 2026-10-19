@@ -1,0 +1,335 @@
+<?php
+
+header('Content-Type: application/json; charset=utf-8');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Idempotency-Key');
+
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
+
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+
+function respond(int $statusCode, array $body): void
+{
+    http_response_code($statusCode);
+    echo json_encode($body, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+function inventory_db(): PDO
+{
+    $host = getenv('DB_HOST') ?: 'db';
+    $database = getenv('DB_NAME') ?: 'inventory_management';
+    $username = getenv('DB_USER') ?: 'root';
+    $password = getenv('DB_PASS') ?: '';
+
+    return new PDO(
+        "mysql:host={$host};dbname={$database};charset=utf8mb4",
+        $username,
+        $password,
+        [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false
+        ]
+    );
+}
+
+if ($method === 'GET' && $path === '/api/health') {
+    respond(200, [
+        'status' => 'ok',
+        'service' => 'inventory-api',
+        'message' => 'Inventory API is running'
+    ]);
+}
+
+if ($method === 'GET' && $path === '/api/products') {
+    try {
+        $pdo = inventory_db();
+
+        $statement = $pdo->query(
+            'SELECT id, category_id, name, sku, description,
+                    price, stock, minimum_stock
+             FROM products
+             ORDER BY id ASC'
+        );
+
+        $products = $statement->fetchAll();
+
+        respond(200, [
+            'status' => 'success',
+            'count' => count($products),
+            'data' => $products
+        ]);
+    } catch (Throwable $exception) {
+        error_log('Inventory product lookup failed: ' . $exception->getMessage());
+
+        respond(500, [
+            'status' => 'error',
+            'message' => 'Unable to retrieve products'
+        ]);
+    }
+}
+
+if ($method === 'POST' && $path === '/api/sales') {
+    $idempotencyKey = trim(
+        $_SERVER['HTTP_IDEMPOTENCY_KEY'] ?? ''
+    );
+
+    if (
+        $idempotencyKey === '' ||
+        strlen($idempotencyKey) > 64 ||
+        !preg_match('/^[A-Za-z0-9._:-]+$/', $idempotencyKey)
+    ) {
+        respond(400, [
+            'status' => 'error',
+            'message' => 'A valid Idempotency-Key header is required'
+        ]);
+    }
+
+    $rawBody = file_get_contents('php://input');
+    $payload = json_decode($rawBody ?: '', true);
+
+    if (!is_array($payload)) {
+        respond(400, [
+            'status' => 'error',
+            'message' => 'Request body must be valid JSON'
+        ]);
+    }
+
+    $sku = trim((string) ($payload['sku'] ?? ''));
+    $quantity = filter_var(
+        $payload['quantity'] ?? null,
+        FILTER_VALIDATE_INT
+    );
+
+    if (
+        $sku === '' ||
+        strlen($sku) > 50 ||
+        $quantity === false ||
+        $quantity < 1 ||
+        $quantity > 1000000
+    ) {
+        respond(400, [
+            'status' => 'error',
+            'message' => 'A valid SKU and quantity are required'
+        ]);
+    }
+
+    $requestHash = hash(
+        'sha256',
+        json_encode(
+            ['sku' => $sku, 'quantity' => $quantity],
+            JSON_UNESCAPED_UNICODE
+        )
+    );
+
+    $pdo = null;
+    $transactionOpen = false;
+
+    try {
+        $pdo = inventory_db();
+        $pdo->beginTransaction();
+        $transactionOpen = true;
+
+        // Reserve the idempotency key. A concurrent duplicate waits
+        // for the first transaction to commit or roll back.
+        $reserve = $pdo->prepare(
+            "INSERT INTO api_sale_requests
+                (idempotency_key, request_hash, status)
+             VALUES (?, ?, 'processing')"
+        );
+        $reserve->execute([$idempotencyKey, $requestHash]);
+
+        // Lock the product row while validating and updating stock.
+        $productStatement = $pdo->prepare(
+            'SELECT id, name, sku, price, stock
+             FROM products
+             WHERE sku = ?
+             FOR UPDATE'
+        );
+        $productStatement->execute([$sku]);
+        $product = $productStatement->fetch();
+
+        if (!$product) {
+            $response = [
+                'status' => 'error',
+                'message' => 'Product not found'
+            ];
+
+            $saveFailure = $pdo->prepare(
+                "UPDATE api_sale_requests
+                 SET status = 'failed', response_json = ?
+                 WHERE idempotency_key = ?"
+            );
+            $saveFailure->execute([
+                json_encode($response, JSON_UNESCAPED_UNICODE),
+                $idempotencyKey
+            ]);
+
+            $pdo->commit();
+            $transactionOpen = false;
+
+            respond(404, $response);
+        }
+
+        $stock = (int) $product['stock'];
+
+        if ($stock < $quantity) {
+            $response = [
+                'status' => 'error',
+                'message' => 'Insufficient stock',
+                'available_stock' => $stock
+            ];
+
+            $saveFailure = $pdo->prepare(
+                "UPDATE api_sale_requests
+                 SET status = 'failed', response_json = ?
+                 WHERE idempotency_key = ?"
+            );
+            $saveFailure->execute([
+                json_encode($response, JSON_UNESCAPED_UNICODE),
+                $idempotencyKey
+            ]);
+
+            $pdo->commit();
+            $transactionOpen = false;
+
+            respond(409, $response);
+        }
+
+        $price = (float) $product['price'];
+        $total = round($price * $quantity, 2);
+
+        $update = $pdo->prepare(
+            'UPDATE products
+             SET stock = stock - ?
+             WHERE id = ? AND stock >= ?'
+        );
+        $update->execute([
+            $quantity,
+            (int) $product['id'],
+            $quantity
+        ]);
+
+        if ($update->rowCount() !== 1) {
+            throw new RuntimeException('Stock update did not succeed');
+        }
+
+        $response = [
+            'status' => 'success',
+            'message' => 'Stock reserved successfully',
+            'sale' => [
+                'sku' => $product['sku'],
+                'name' => $product['name'],
+                'quantity' => $quantity,
+                'unit_price' => number_format($price, 2, '.', ''),
+                'total' => number_format($total, 2, '.', ''),
+                'remaining_stock' => $stock - $quantity
+            ]
+        ];
+
+        $complete = $pdo->prepare(
+            "UPDATE api_sale_requests
+             SET status = 'completed', response_json = ?
+             WHERE idempotency_key = ?"
+        );
+        $complete->execute([
+            json_encode($response, JSON_UNESCAPED_UNICODE),
+            $idempotencyKey
+        ]);
+
+        $pdo->commit();
+        $transactionOpen = false;
+
+        respond(200, $response);
+
+    } catch (PDOException $exception) {
+        if ($transactionOpen && $pdo instanceof PDO && $pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+
+        // A duplicate key means this request key was already used.
+        if ($exception->getCode() === '23000') {
+            try {
+                $check = inventory_db()->prepare(
+                    'SELECT request_hash, status, response_json
+                     FROM api_sale_requests
+                     WHERE idempotency_key = ?'
+                );
+                $check->execute([$idempotencyKey]);
+                $existing = $check->fetch();
+
+                if ($existing) {
+                    if (!hash_equals($existing['request_hash'], $requestHash)) {
+                        respond(409, [
+                            'status' => 'error',
+                            'message' => 'Idempotency-Key was already used for a different request'
+                        ]);
+                    }
+
+                  
+                if ($existing['status'] === 'failed') {
+                    $savedResponse = json_decode(
+                        $existing['response_json'] ?? '',
+                        true
+                    );
+
+                    if (is_array($savedResponse)) {
+                        $message = $savedResponse['message'] ?? '';
+
+                        $httpStatus = match ($message) {
+                            'Product not found' => 404,
+                            'Insufficient stock' => 409,
+                            default => 409
+                        };
+
+                        respond($httpStatus, $savedResponse);
+                    }
+
+                    respond(409, [
+                        'status' => 'error',
+                        'message' => 'Previous request failed'
+                    ]);
+                }
+
+
+                    respond(409, [
+                        'status' => 'error',
+                        'message' => 'Request is not in a final state; reconcile before retrying'
+                    ]);
+                }
+            } catch (Throwable $checkException) {
+                error_log('Idempotency lookup failed: ' . $checkException->getMessage());
+            }
+        }
+
+        error_log('Inventory sale database error: ' . $exception->getMessage());
+
+        respond(500, [
+            'status' => 'error',
+            'message' => 'Unable to process sale'
+        ]);
+
+    } catch (Throwable $exception) {
+        if ($transactionOpen && $pdo instanceof PDO && $pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+
+        error_log('Inventory sale failed: ' . $exception->getMessage());
+
+        respond(500, [
+            'status' => 'error',
+            'message' => 'Unable to process sale'
+        ]);
+    }
+}
+
+respond(404, [
+    'status' => 'error',
+    'message' => 'Endpoint not found'
+]);
