@@ -26,7 +26,6 @@ function inventory_api_request(
 
     for ($attempt = 1; $attempt <= 3; $attempt++) {
         $ch = curl_init($api_url);
-
         $headers = ["Accept: application/json"];
 
         if ($payload !== null) {
@@ -56,7 +55,6 @@ function inventory_api_request(
         $response = curl_exec($ch);
         $curl_error = curl_error($ch);
         $http_code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
         curl_close($ch);
 
         if (
@@ -108,7 +106,9 @@ function validate_sale_response($response, $sku, $quantity)
     $data = $response["sale"] ?? $response["data"] ?? null;
 
     if (!is_array($data)) {
-        throw new RuntimeException("Data penjualan Inventory tidak valid.");
+        throw new RuntimeException(
+            "Data penjualan Inventory tidak valid."
+        );
     }
 
     $response_sku = (string) ($data["sku"] ?? "");
@@ -139,7 +139,7 @@ function validate_sale_response($response, $sku, $quantity)
 }
 
 /**
- * Kembalikan stok Inventory jika penyimpanan lokal gagal.
+ * Kompensasi stok jika penyimpanan POS gagal.
  */
 function compensate_sales($confirmed_sales, $transaction_key)
 {
@@ -156,11 +156,15 @@ function compensate_sales($confirmed_sales, $transaction_key)
 
             if (($response["status"] ?? "") !== "success") {
                 $all_compensated = false;
-                error_log("Kompensasi gagal untuk SKU " . $sale["sku"]);
+                error_log(
+                    "Kompensasi gagal untuk SKU " . $sale["sku"]
+                );
             }
         } catch (Throwable $e) {
             $all_compensated = false;
-            error_log("Kompensasi gagal: " . $e->getMessage());
+            error_log(
+                "Kompensasi gagal: " . $e->getMessage()
+            );
         }
     }
 
@@ -168,7 +172,7 @@ function compensate_sales($confirmed_sales, $transaction_key)
 }
 
 /**
- * Pastikan request POST.
+ * Request harus POST.
  */
 if ($_SERVER["REQUEST_METHOD"] !== "POST") {
     redirect_transaction("error", "Metode request tidak valid.");
@@ -196,11 +200,7 @@ if (
 }
 
 /**
- * PERBAIKAN:
- * Terima angka biasa atau format rupiah dengan pemisah ribuan.
- * Contoh: 50000, 50.000, 50,000, Rp 50.000.
- *
- * Input ini menganggap titik/koma sebagai pemisah ribuan.
+ * Normalisasi nominal pembayaran.
  */
 $cash_normalized = preg_replace(
     '/^(?:Rp\.?\s*)/i',
@@ -218,7 +218,10 @@ if (
     $cash_normalized === "" ||
     !ctype_digit($cash_normalized)
 ) {
-    redirect_transaction("error", "Nominal uang bayar tidak valid.");
+    redirect_transaction(
+        "error",
+        "Nominal uang bayar tidak valid."
+    );
 }
 
 $cash = (float) $cash_normalized;
@@ -230,12 +233,14 @@ if (!is_array($cart) || count($cart) === 0) {
 }
 
 /**
- * Ambil produk Inventory.
+ * Ambil katalog dari Inventory API.
  */
 try {
     $inventory_products = get_inventory_products();
 } catch (Throwable $e) {
-    error_log("Gagal mengambil katalog Inventory: " . $e->getMessage());
+    error_log(
+        "Gagal mengambil katalog Inventory: " . $e->getMessage()
+    );
 
     redirect_transaction(
         "error",
@@ -261,7 +266,107 @@ foreach ($inventory_products as $product) {
 }
 
 /**
- * Mapping SKU ke produk lokal POS.
+ * Sinkronisasi produk Inventory yang belum ada di POS.
+ * Produk yang sudah ada tidak dibuat ulang sehingga item_id lama tetap.
+ */
+$local_items = get_items($conn);
+$local_items_by_sku = [];
+
+foreach ($local_items as $local_item) {
+    $sku = trim((string) ($local_item["item_id_txt"] ?? ""));
+
+    if ($sku !== "") {
+        $local_items_by_sku[$sku] = $local_item;
+    }
+}
+
+$check_stmt = mysqli_prepare(
+    $conn,
+    "SELECT item_id
+     FROM items
+     WHERE item_id_txt = ?
+     LIMIT 1"
+);
+
+$insert_stmt = mysqli_prepare(
+    $conn,
+    "INSERT INTO items (
+        item_id_txt,
+        item_name,
+        item_price,
+        create_at,
+        last_modified
+    ) VALUES (?, ?, ?, ?, ?)"
+);
+
+if (!$check_stmt || !$insert_stmt) {
+    redirect_transaction(
+        "error",
+        "Gagal menyiapkan sinkronisasi produk POS."
+    );
+}
+
+foreach ($catalog as $sku => $product) {
+    if (isset($local_items_by_sku[$sku])) {
+        continue;
+    }
+
+    $name = trim((string) ($product["item_name"] ?? ""));
+    $price = (string) ($product["item_price"] ?? "");
+
+    if (
+        $name === "" ||
+        !is_numeric($price) ||
+        (float) $price < 0
+    ) {
+        error_log(
+            "Produk Inventory tidak valid untuk sinkronisasi: " . $sku
+        );
+        continue;
+    }
+
+    $created_at = date("m/d/Y h:i:s a");
+
+    // Periksa ulang SKU untuk mengurangi risiko duplikasi.
+    mysqli_stmt_bind_param($check_stmt, "s", $sku);
+
+    if (!mysqli_stmt_execute($check_stmt)) {
+        error_log(
+            "Gagal memeriksa SKU " . $sku . ": " .
+            mysqli_stmt_error($check_stmt)
+        );
+        continue;
+    }
+
+    $check_result = mysqli_stmt_get_result($check_stmt);
+
+    if ($check_result && mysqli_num_rows($check_result) > 0) {
+        continue;
+    }
+
+    mysqli_stmt_bind_param(
+        $insert_stmt,
+        "sssss",
+        $sku,
+        $name,
+        $price,
+        $created_at,
+        $created_at
+    );
+
+    if (!mysqli_stmt_execute($insert_stmt)) {
+        error_log(
+            "Gagal sinkron SKU " . $sku . ": " .
+            mysqli_stmt_error($insert_stmt)
+        );
+    }
+}
+
+mysqli_stmt_close($check_stmt);
+mysqli_stmt_close($insert_stmt);
+
+/**
+ * Muat ulang mapping agar item_id baru tersedia.
  */
 $local_items = get_items($conn);
 $local_items_by_sku = [];
@@ -275,13 +380,16 @@ foreach ($local_items as $local_item) {
 }
 
 /**
- * Gabungkan SKU yang sama dalam keranjang.
+ * Validasi dan gabungkan SKU pada keranjang.
  */
 $quantities = [];
 
 foreach ($cart as $cart_item) {
     if (!is_array($cart_item)) {
-        redirect_transaction("error", "Format keranjang tidak valid.");
+        redirect_transaction(
+            "error",
+            "Format keranjang tidak valid."
+        );
     }
 
     $sku = trim((string) (
@@ -295,7 +403,11 @@ foreach ($cart as $cart_item) {
         FILTER_VALIDATE_INT
     );
 
-    if ($sku === "" || $quantity === false || $quantity < 1) {
+    if (
+        $sku === "" ||
+        $quantity === false ||
+        $quantity < 1
+    ) {
         redirect_transaction(
             "error",
             "SKU atau jumlah produk tidak valid."
@@ -312,7 +424,8 @@ foreach ($cart as $cart_item) {
     if (!isset($local_items_by_sku[$sku])) {
         redirect_transaction(
             "error",
-            "SKU " . $sku . " belum terdaftar di POS."
+            "SKU " . $sku .
+            " belum berhasil disinkronkan ke POS."
         );
     }
 
@@ -320,7 +433,7 @@ foreach ($cart as $cart_item) {
 }
 
 /**
- * Siapkan item berdasarkan ID lokal POS.
+ * Siapkan item berdasarkan ID lokal dan harga katalog Inventory.
  */
 $expected_items = [];
 $estimated_total = 0;
@@ -341,7 +454,7 @@ foreach ($quantities as $sku => $quantity) {
     $expected_items[] = [
         "item_id" => (int) $local_item["item_id"],
         "sku" => $sku,
-        "item_name" => (string) $local_item["item_name"],
+        "item_name" => (string) $product["item_name"],
         "quantity" => $quantity,
         "estimated_unit_price" => $unit_price,
     ];
@@ -357,7 +470,7 @@ if ($cash < $estimated_total) {
 }
 
 /**
- * Cek ID transaksi duplikat.
+ * Periksa ID transaksi duplikat.
  */
 $stmt = mysqli_prepare(
     $conn,
@@ -368,7 +481,10 @@ $stmt = mysqli_prepare(
 );
 
 if (!$stmt) {
-    redirect_transaction("error", "Gagal memvalidasi ID transaksi.");
+    redirect_transaction(
+        "error",
+        "Gagal memvalidasi ID transaksi."
+    );
 }
 
 mysqli_stmt_bind_param($stmt, "s", $transaction_key);
@@ -387,7 +503,7 @@ if ($duplicate_exists) {
 }
 
 /**
- * Proses penjualan Inventory.
+ * Penjualan Inventory.
  */
 $confirmed_sales = [];
 $actual_items = [];
@@ -397,9 +513,13 @@ try {
     foreach ($expected_items as $item) {
         $sku = $item["sku"];
         $quantity = (int) $item["quantity"];
-
         $sale_key = "pos-" . $transaction_key . "-" . $sku;
 
+        /*
+         * Catat kompensasi SEBELUM validasi respons.
+         * Jika API berhasil menjual tetapi respons tidak sesuai,
+         * proses pemulihan tetap mengetahui sale_key yang digunakan.
+         */
         $response = inventory_api_request(
             "POST",
             "/api/sales",
@@ -410,16 +530,18 @@ try {
             $sale_key
         );
 
+        if (($response["status"] ?? "") === "success") {
+            $confirmed_sales[] = [
+                "sku" => $sku,
+                "sale_key" => $sale_key,
+            ];
+        }
+
         $sale = validate_sale_response(
             $response,
             $sku,
             $quantity
         );
-
-        $confirmed_sales[] = [
-            "sku" => $sku,
-            "sale_key" => $sale_key,
-        ];
 
         $sale["item_id"] = $item["item_id"];
         $sale["item_name"] = $item["item_name"];
@@ -447,7 +569,7 @@ try {
 }
 
 /**
- * Validasi total aktual dan hitung kembalian.
+ * Validasi total aktual dan kembalian.
  */
 if ($cash < $actual_total) {
     $compensated = compensate_sales(
@@ -471,7 +593,7 @@ foreach ($actual_items as $item) {
 }
 
 /**
- * Simpan header dan detail transaksi secara atomik.
+ * Simpan header dan detail secara atomik.
  */
 mysqli_begin_transaction($conn);
 
@@ -498,7 +620,9 @@ try {
     );
 
     if (!$stmt) {
-        throw new RuntimeException("Gagal menyiapkan header transaksi.");
+        throw new RuntimeException(
+            "Gagal menyiapkan header transaksi."
+        );
     }
 
     mysqli_stmt_bind_param(
@@ -514,7 +638,9 @@ try {
     );
 
     if (!mysqli_stmt_execute($stmt)) {
-        throw new RuntimeException("Gagal menyimpan header transaksi.");
+        throw new RuntimeException(
+            "Gagal menyimpan header transaksi."
+        );
     }
 
     $transaction_id = (int) mysqli_insert_id($conn);
@@ -533,7 +659,9 @@ try {
     );
 
     if (!$detail_stmt) {
-        throw new RuntimeException("Gagal menyiapkan detail transaksi.");
+        throw new RuntimeException(
+            "Gagal menyiapkan detail transaksi."
+        );
     }
 
     foreach ($actual_items as $item) {
@@ -564,7 +692,9 @@ try {
     mysqli_stmt_close($detail_stmt);
 
     if (!mysqli_commit($conn)) {
-        throw new RuntimeException("Commit transaksi gagal.");
+        throw new RuntimeException(
+            "Commit transaksi gagal."
+        );
     }
 } catch (Throwable $e) {
     mysqli_rollback($conn);

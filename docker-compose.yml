@@ -23,6 +23,7 @@ services:
       DB_NAME: inventory_management
       DB_USER: root
       DB_PASS: "rootCC2026!"
+      SYNC_TOKEN: "GANTI_DENGAN_TOKEN_ACAK_PANJANG_YANG_SAMA"
     volumes:
       - ./inventory-management-system-main:/var/www/html
     depends_on:
@@ -39,6 +40,7 @@ services:
       DB_NAME: DB_Pos
       DB_USER: root
       DB_PASS: "rootCC2026!"
+      SYNC_TOKEN: "GANTI_DENGAN_TOKEN_ACAK_PANJANG_YANG_SAMA"
     volumes:
       - ./POS-PHP-main:/var/www/html
     depends_on:
